@@ -25,7 +25,11 @@
 /*******************************************************************************
  * Definitions
  ******************************************************************************/
-#define xJUST_MASTER
+//#define DEVICE_IS_MASTER
+//#define DEVICE_IS_SLAVE_A
+#define DEVICE_IS_SLAVE_B
+//#define DEVICE_IS_SLAVE_C
+//#define DEVICE_IS_SLAVE_D
 
 /* UART instance and clock */
 #define MASTER_UART UART3
@@ -34,27 +38,19 @@
 #define MASTER_UART_RX_TX_IRQn UART3_RX_TX_IRQn
 
 /* UART instance and clock */
-#define LOCAL_SLAVE_UART UART3
-#define LOCAL_SLAVE_UART_CLKSRC UART3_CLK_SRC
-#define LOCAL_SLAVE_UART_CLK_FREQ CLOCK_GetFreq(UART3_CLK_SRC)
-#define LOCAL_SLAVE_UART_RX_TX_IRQn UART3_RX_TX_IRQn
-
-/* UART instance and clock */
-#define SLAVE_UART UART4
-#define SLAVE_UART_CLKSRC UART4_CLK_SRC
-#define SLAVE_UART_CLK_FREQ CLOCK_GetFreq(UART4_CLK_SRC)
-#define SLAVE_UART_RX_TX_IRQn UART4_RX_TX_IRQn
+#define SLAVE_UART UART3
+#define SLAVE_UART_CLKSRC UART3_CLK_SRC
+#define SLAVE_UART_CLK_FREQ CLOCK_GetFreq(UART3_CLK_SRC)
+#define SLAVE_UART_RX_TX_IRQn UART3_RX_TX_IRQn
 
 /* Task priorities. */
 #define init_task_PRIORITY (configMAX_PRIORITIES - 2)
 #define test_task_heap_size_d	(192)
 
-#define app_message_id_1_d (0x01<<2|message_size_2_bytes_d)
-#define app_message_id_2_d (0x02<<2|message_size_4_bytes_d)
-#define app_message_id_3_d (0x03<<2|message_size_8_bytes_d)
-#define app_message_id_4_d (0x04<<2|message_size_2_bytes_d)
-#define app_message_id_5_d (0x05<<2|message_size_4_bytes_d)
-#define app_message_id_6_d (0x06<<2|message_size_8_bytes_d)
+#define app_message_id_1_d (message_size_2_bytes_d<<4|0x01)
+#define app_message_id_2_d (message_size_2_bytes_d<<4|0x02)
+#define app_message_id_3_d (message_size_2_bytes_d<<4|0x03)
+#define app_message_id_4_d (message_size_2_bytes_d<<4|0x04)
 
 
 
@@ -63,14 +59,14 @@
  ******************************************************************************/
 static void test_task(void *pvParameters);
 
-static void	message_4_callback_local_slave(void* message);
-static void	message_5_callback_local_slave(void* message);
-static void	message_6_callback_local_slave(void* message);
-static void	message_1_callback_local_slave(void* message);
-
-static void	message_1_callback_slave(void* message);
-static void	message_2_callback_slave(void* message);
-static void	message_3_callback_slave(void* message);
+static void	message_1_transmit_callback(void* message);
+static void	message_1_receive_callback(void* message);
+static void	message_2_transmit_callback(void* message);
+static void	message_2_receive_callback(void* message);
+static void	message_3_transmit_callback(void* message);
+static void	message_3_receive_callback(void* message);
+static void	message_4_transmit_callback(void* message);
+static void	message_4_receive_callback(void* message);
 /*******************************************************************************
  * Variables
  ******************************************************************************/
@@ -83,12 +79,39 @@ static void	message_3_callback_slave(void* message);
  */
 int main(void)
 {
+	/* Define the init structure for the input switch pin */
+	gpio_pin_config_t sw_config = {
+		kGPIO_DigitalInput,
+		0,
+	};
+
+	/* Define the init structure for the output LED pin */
+	gpio_pin_config_t led_config = {
+		kGPIO_DigitalOutput,
+		1,
+	};
+
     /* Init board hardware. */
     BOARD_InitPins();
     BOARD_BootClockRUN();
     BOARD_InitDebugConsole();
     NVIC_SetPriority(MASTER_UART_RX_TX_IRQn, 5);
     NVIC_SetPriority(SLAVE_UART_RX_TX_IRQn, 5);
+
+    /* Init input SW2 GPIO. */
+	GPIO_PinInit(BOARD_SW2_GPIO, BOARD_SW2_GPIO_PIN, &sw_config);
+
+	/* Init input SW2 GPIO. */
+	GPIO_PinInit(BOARD_SW3_GPIO, BOARD_SW3_GPIO_PIN, &sw_config);
+
+	/* Init output RED LED GPIO. */
+	GPIO_PinInit(BOARD_LED_RED_GPIO, BOARD_LED_RED_GPIO_PIN, &led_config);
+
+	/* Init output BLUE LED GPIO. */
+	GPIO_PinInit(BOARD_LED_BLUE_GPIO, BOARD_LED_BLUE_GPIO_PIN, &led_config);
+
+	/* Init output GREEN LED GPIO. */
+	GPIO_PinInit(BOARD_LED_GREEN_GPIO, BOARD_LED_GREEN_GPIO_PIN, &led_config);
 
 
     if (xTaskCreate(test_task, "test_task", test_task_heap_size_d, NULL, init_task_PRIORITY, NULL) != pdPASS)
@@ -97,7 +120,7 @@ int main(void)
         while (1)
             ;
     }
-    PRINTF(" *** LIN driver demo ***\r\n");
+    PRINTF(" *** LIN driver demo v1.40***\r\n");
     vTaskStartScheduler();
     for (;;)
         ;
@@ -109,10 +132,12 @@ int main(void)
 static void test_task(void *pvParameters)
 {
 	int error;
+	int msg_count = 0;
 	lin1d3_nodeConfig_t node_config;
 	lin1d3_handle_t* master_handle;
 	lin1d3_handle_t* slave_handle;
-	lin1d3_handle_t* local_slave_handle;
+
+#ifdef DEVICE_IS_MASTER
 	/* Set Master Config */
 	node_config.type = lin1d3_master_nodeType;
 	node_config.bitrate = 9600;
@@ -122,54 +147,65 @@ static void test_task(void *pvParameters)
 	memset(node_config.messageTable,0, (sizeof(node_config.messageTable[0])*lin1d3_max_supported_messages_per_node_cfg_d));
 	/* Init Master node */
 	master_handle = lin1d3_InitNode(node_config);
-#if !defined(JUST_MASTER)
+#endif
+
 	/* Set Slave Config */
 	node_config.type = lin1d3_slave_nodeType;
 	node_config.bitrate = 9600;
 	node_config.uartBase = SLAVE_UART;
 	node_config.srcclk = SLAVE_UART_CLK_FREQ;
+#ifdef DEVICE_IS_MASTER
+	node_config.skip_uart_init = 1;
+	node_config.uart_rtos_handle = master_handle->uart_rtos_handle;
+#else
 	node_config.skip_uart_init = 0;
+#endif
 	memset(node_config.messageTable,0, (sizeof(node_config.messageTable[0])*lin1d3_max_supported_messages_per_node_cfg_d));
+#ifdef DEVICE_IS_SLAVE_A
 	node_config.messageTable[0].ID = app_message_id_1_d;
 	node_config.messageTable[0].rx = 0;
-	node_config.messageTable[0].handler = message_1_callback_slave;
+	node_config.messageTable[0].handler = message_1_transmit_callback;
+	node_config.messageTable[1].ID = app_message_id_2_d;
+	node_config.messageTable[1].rx = 1;
+	node_config.messageTable[1].handler = message_2_receive_callback;
+	node_config.messageTable[2].ID = app_message_id_3_d;
+	node_config.messageTable[2].rx = 1;
+	node_config.messageTable[2].handler = message_3_receive_callback;
+	node_config.messageTable[3].ID = app_message_id_4_d;
+	node_config.messageTable[3].rx = 1;
+	node_config.messageTable[3].handler = message_4_receive_callback;
+#endif
+#ifdef DEVICE_IS_SLAVE_B
+	node_config.messageTable[0].ID = app_message_id_1_d;
+	node_config.messageTable[0].rx = 1;
+	node_config.messageTable[0].handler = message_1_receive_callback;
 	node_config.messageTable[1].ID = app_message_id_2_d;
 	node_config.messageTable[1].rx = 0;
-	node_config.messageTable[1].handler = message_2_callback_slave;
-	node_config.messageTable[2].ID = app_message_id_3_d;
-	node_config.messageTable[2].rx = 0;
-	node_config.messageTable[2].handler = message_3_callback_slave;
+	node_config.messageTable[1].handler = message_2_transmit_callback;
+#endif
+#ifdef DEVICE_IS_SLAVE_C
+	node_config.messageTable[0].ID = app_message_id_1_d;
+	node_config.messageTable[0].rx = 1;
+	node_config.messageTable[0].handler = message_1_receive_callback;
+	node_config.messageTable[1].ID = app_message_id_3_d;
+	node_config.messageTable[1].rx = 0;
+	node_config.messageTable[1].handler = message_3_transmit_callback;
+#endif
+#ifdef DEVICE_IS_SLAVE_D
+	node_config.messageTable[0].ID = app_message_id_1_d;
+	node_config.messageTable[0].rx = 1;
+	node_config.messageTable[0].handler = message_1_receive_callback;
+	node_config.messageTable[1].ID = app_message_id_4_d;
+	node_config.messageTable[1].rx = 0;
+	node_config.messageTable[1].handler = message_4_transmit_callback;
+#endif
 	/* Init Slave Node*/
 	slave_handle = lin1d3_InitNode(node_config);
 
-	/* Set local Slave Config */
-	node_config.type = lin1d3_slave_nodeType;
-	node_config.bitrate = 9600;
-	node_config.uartBase = LOCAL_SLAVE_UART;
-	node_config.srcclk = LOCAL_SLAVE_UART_CLK_FREQ;
-	memset(node_config.messageTable,0, (sizeof(node_config.messageTable[0])*lin1d3_max_supported_messages_per_node_cfg_d));
-	node_config.messageTable[0].ID = app_message_id_4_d;
-	node_config.messageTable[0].rx = 0;
-	node_config.messageTable[0].handler = message_4_callback_local_slave;
-	node_config.messageTable[1].ID = app_message_id_5_d;
-	node_config.messageTable[1].rx = 0;
-	node_config.messageTable[1].handler = message_5_callback_local_slave;
-	node_config.messageTable[2].ID = app_message_id_6_d;
-	node_config.messageTable[2].rx = 0;
-	node_config.messageTable[2].handler = message_6_callback_local_slave;
-	node_config.messageTable[3].ID = app_message_id_1_d;
-	node_config.messageTable[3].rx = 1;
-	node_config.messageTable[3].handler = message_1_callback_local_slave;
-	node_config.skip_uart_init = 1;
-	node_config.uart_rtos_handle = master_handle->uart_rtos_handle;
-	/* Init local Slave Node*/
-	local_slave_handle = lin1d3_InitNode(node_config);
-#endif
 
-	if((NULL == master_handle)
-#if !defined(JUST_MASTER)
-		|| (NULL == slave_handle)
-		/*|| (NULL == local_slave_handle)*/
+	if((NULL == slave_handle)
+#ifdef DEVICE_IS_MASTER
+		|| (NULL == master_handle)
 #endif
 	   ){
 		PRINTF(" Init failed!! \r\n");
@@ -181,91 +217,189 @@ static void test_task(void *pvParameters)
 
 	while (kStatus_Success == error)
     {
-    	vTaskDelay(200);
-    	lin1d3_masterSendMessage(master_handle, app_message_id_1_d);
-    	vTaskDelay(200);
+#ifdef DEVICE_IS_MASTER
+		vTaskDelay(pdMS_TO_TICKS(25));
     	lin1d3_masterSendMessage(master_handle, app_message_id_2_d);
-    	vTaskDelay(200);
-    	lin1d3_masterSendMessage(master_handle, app_message_id_3_d);
-    	vTaskDelay(200);
-    	lin1d3_masterSendMessage(master_handle, app_message_id_4_d);
-    	vTaskDelay(200);
-    	lin1d3_masterSendMessage(master_handle, app_message_id_5_d);
-    	vTaskDelay(200);
-    	lin1d3_masterSendMessage(master_handle, app_message_id_6_d);
+    	vTaskDelay(pdMS_TO_TICKS(25));
+		//lin1d3_masterSendMessage(master_handle, app_message_id_3_d);
+		vTaskDelay(pdMS_TO_TICKS(25));
+		//lin1d3_masterSendMessage(master_handle, app_message_id_4_d);
+		vTaskDelay(pdMS_TO_TICKS(25));
+		msg_count++;
+		if (msg_count == 10)
+		{
+			msg_count = 0;
+			lin1d3_masterSendMessage(master_handle, app_message_id_1_d);
+		}
+#else
+    	vTaskDelay(pdMS_TO_TICKS(1000));
+#endif
     }
 
     vTaskSuspend(NULL);
 }
 
-
-static void	message_4_callback_local_slave(void* message)
+static void	message_1_transmit_callback(void* message)
 {
+	static uint8_t count = 0;
 	uint8_t* message_data = (uint8_t*)message;
-	PRINTF("Local Slave got message 4 request\r\n");
-	message_data[0] = 1;
-	message_data[1] = 2;
+
+	PRINTF("Slave got message 1 transmit request\r\n");
+
+	message_data[0] = count;
+	count++;
+	count %= 4;
 }
 
-static void	message_5_callback_local_slave(void* message)
+static void	message_1_receive_callback(void* message)
 {
 	uint8_t* message_data = (uint8_t*)message;
-	PRINTF("Local Slave got message 5 request\r\n");
-	message_data[0] = 1;
-	message_data[1] = 2;
-	message_data[2] = 3;
-	message_data[3] = 4;
+
+	PRINTF("Slave received message 1\r\n");
+
+	if (message_data[0] == 0)
+	{
+		// CLEAR ALL RGB LEDs
+		GPIO_PortSet(BOARD_LED_RED_GPIO, 1U << BOARD_LED_RED_GPIO_PIN);
+		GPIO_PortSet(BOARD_LED_GREEN_GPIO, 1U << BOARD_LED_GREEN_GPIO_PIN);
+		GPIO_PortSet(BOARD_LED_BLUE_GPIO, 1U << BOARD_LED_BLUE_GPIO_PIN);
+	}
+	else if (message_data[0] == 1)
+	{
+		// CLEAR ALL G & B LEDs
+		GPIO_PortSet(BOARD_LED_GREEN_GPIO, 1U << BOARD_LED_GREEN_GPIO_PIN);
+		GPIO_PortSet(BOARD_LED_BLUE_GPIO, 1U << BOARD_LED_BLUE_GPIO_PIN);
+
+		//TURN ON RED LED
+		GPIO_PortClear(BOARD_LED_RED_GPIO, 1U << BOARD_LED_RED_GPIO_PIN);
+	}
+	else if (message_data[0] == 2)
+	{
+		// CLEAR ALL R & B LEDs
+		GPIO_PortSet(BOARD_LED_RED_GPIO, 1U << BOARD_LED_RED_GPIO_PIN);
+		GPIO_PortSet(BOARD_LED_BLUE_GPIO, 1U << BOARD_LED_BLUE_GPIO_PIN);
+
+		//TURN ON GREEN LED
+		GPIO_PortClear(BOARD_LED_GREEN_GPIO, 1U << BOARD_LED_GREEN_GPIO_PIN);
+	}
+	else if (message_data[0] == 3)
+	{
+		// CLEAR ALL R & G LEDs
+		GPIO_PortSet(BOARD_LED_RED_GPIO, 1U << BOARD_LED_RED_GPIO_PIN);
+		GPIO_PortSet(BOARD_LED_GREEN_GPIO, 1U << BOARD_LED_GREEN_GPIO_PIN);
+
+		//TURN ON RED LED
+		GPIO_PortClear(BOARD_LED_BLUE_GPIO, 1U << BOARD_LED_BLUE_GPIO_PIN);
+	}
+	else
+	{
+		// CLEAR ALL RGB LEDs
+		GPIO_PortSet(BOARD_LED_RED_GPIO, 1U << BOARD_LED_RED_GPIO_PIN);
+		GPIO_PortSet(BOARD_LED_GREEN_GPIO, 1U << BOARD_LED_GREEN_GPIO_PIN);
+		GPIO_PortSet(BOARD_LED_BLUE_GPIO, 1U << BOARD_LED_BLUE_GPIO_PIN);
+		PRINTF("INVALID MSG 1 LED COLOR!\r\n");
+	}
 }
 
-static void	message_6_callback_local_slave(void* message)
+static void	message_2_transmit_callback(void* message)
 {
 	uint8_t* message_data = (uint8_t*)message;
-	PRINTF("Local Slave got message 6 request\r\n");
-	message_data[0] = 1;
-	message_data[1] = 2;
-	message_data[2] = 3;
-	message_data[3] = 4;
-	message_data[4] = 5;
-	message_data[5] = 6;
-	message_data[6] = 7;
-	message_data[7] = 8;
+
+	PRINTF("Slave got message 2 transmit request\r\n");
+
+	if (GPIO_PinRead(BOARD_SW2_GPIO, BOARD_SW2_GPIO_PIN) == 0)
+	{
+		message_data[0] |= 0x1;
+	}
+
+	if (GPIO_PinRead(BOARD_SW3_GPIO, BOARD_SW3_GPIO_PIN) == 0)
+	{
+		message_data[0] |= 0x2;
+	}
 }
 
-static void	message_1_callback_local_slave(void* message)
+static void	message_2_receive_callback(void* message)
 {
 	uint8_t* message_data = (uint8_t*)message;
-	PRINTF("Local Slave got response to message 1 %d,%d\r\n", message_data[0], message_data[1]);
+	PRINTF("Slave received message 2\r\n");
+
+	if (message_data[0] != 0)
+	{
+		//TURN ON RED LED
+		GPIO_PortClear(BOARD_LED_RED_GPIO, 1U << BOARD_LED_RED_GPIO_PIN);
+	}
+	else
+	{
+		//TURN OFF RED LED
+		GPIO_PortSet(BOARD_LED_RED_GPIO, 1U << BOARD_LED_RED_GPIO_PIN);
+	}
 }
 
-static void	message_1_callback_slave(void* message)
+static void	message_3_transmit_callback(void* message)
 {
 	uint8_t* message_data = (uint8_t*)message;
-	PRINTF("Slave got message 1 request\r\n");
-	message_data[0] = 79;
-	message_data[1] = 80;
+	PRINTF("Slave got message 3 transmit request\r\n");
+
+	if (GPIO_PinRead(BOARD_SW2_GPIO, BOARD_SW2_GPIO_PIN) == 0)
+	{
+		message_data[0] |= 0x1;
+	}
+
+	if (GPIO_PinRead(BOARD_SW3_GPIO, BOARD_SW3_GPIO_PIN) == 0)
+	{
+		message_data[0] |= 0x2;
+	}
 }
 
-static void	message_2_callback_slave(void* message)
+static void	message_3_receive_callback(void* message)
 {
 	uint8_t* message_data = (uint8_t*)message;
-	PRINTF("Slave got message 2 request\r\n");
-	message_data[0] = 79;
-	message_data[1] = 80;
-	message_data[2] = 81;
-	message_data[3] = 82;
+	PRINTF("Slave received message 3\r\n");
+
+	if (message_data[0] != 0)
+	{
+		//TURN ON GREEN LED
+		GPIO_PortClear(BOARD_LED_GREEN_GPIO, 1U << BOARD_LED_GREEN_GPIO_PIN);
+	}
+	else
+	{
+		//TURN OFF GREEN LED
+		GPIO_PortSet(BOARD_LED_GREEN_GPIO, 1U << BOARD_LED_GREEN_GPIO_PIN);
+	}
 }
 
-static void	message_3_callback_slave(void* message)
+static void	message_4_transmit_callback(void* message)
 {
 	uint8_t* message_data = (uint8_t*)message;
-	PRINTF("Slave got message 3 request\r\n");
-	message_data[0] = 79;
-	message_data[1] = 80;
-	message_data[2] = 81;
-	message_data[3] = 82;
-	message_data[4] = 83;
-	message_data[5] = 84;
-	message_data[6] = 85;
-	message_data[7] = 86;
+	PRINTF("Slave got message 4 transmit request\r\n");
+
+	if (GPIO_PinRead(BOARD_SW2_GPIO, BOARD_SW2_GPIO_PIN) == 0)
+	{
+		message_data[0] |= 0x1;
+	}
+
+	if (GPIO_PinRead(BOARD_SW3_GPIO, BOARD_SW3_GPIO_PIN) == 0)
+	{
+		message_data[0] |= 0x2;
+	}
 }
+
+static void	message_4_receive_callback(void* message)
+{
+	uint8_t* message_data = (uint8_t*)message;
+	PRINTF("Slave received message 4\r\n");
+
+	if (message_data[0] != 0)
+	{
+		//TURN ON BLUE LED
+		GPIO_PortClear(BOARD_LED_BLUE_GPIO, 1U << BOARD_LED_BLUE_GPIO_PIN);
+	}
+	else
+	{
+		//TURN OFF BLUE LED
+		GPIO_PortSet(BOARD_LED_BLUE_GPIO, 1U << BOARD_LED_BLUE_GPIO_PIN);
+	}
+}
+
+
 

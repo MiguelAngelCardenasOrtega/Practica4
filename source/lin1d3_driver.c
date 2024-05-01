@@ -19,10 +19,22 @@
 
 #define size_of_lin_header_d (2)
 
+#define ID0_BIT_MASK		 (0x01)
+#define ID1_BIT_MASK		 (0x02)
+#define ID2_BIT_MASK		 (0x04)
+#define ID3_BIT_MASK		 (0x08)
+#define ID4_BIT_MASK		 (0x10)
+#define ID5_BIT_MASK		 (0x20)
+#define EVEN_PARITY_BIT_MASK (0x40)
+#define ODD_PARITY_BIT_MASK  (0x80)
+
 /*Static function prototypes */
 static void master_task(void *pvParameters);
 static void slave_task(void *pvParameters);
-
+static void calculate_parity_bits(uint8_t* header);
+static bool check_parity_bits(uint8_t* header);
+static void calculate_checksum(uint8_t* message, uint8_t message_size);
+static bool check_checksum(uint8_t* message, uint8_t message_size);
 
 
 /******************************************************************************
@@ -136,7 +148,6 @@ static void master_task(void *pvParameters)
 {
 	lin1d3_handle_t* handle = (lin1d3_handle_t*)pvParameters;
 	uint8_t  ID;
-	uint8_t  synch_break_byte = 0;
 	uint8_t  lin1p3_header[] = {0x55, 0x00};
 	uint8_t  lin1p3_message[size_of_uart_buffer];
 	uint8_t  message_size = 0;
@@ -150,25 +161,33 @@ static void master_task(void *pvParameters)
         if(xQueueReceive(handle->node_queue, &ID, portMAX_DELAY)){
         	/* Build and send the LIN Header */
         	/* Put the ID into the header */
-        	lin1p3_header[1] = ID<<2;
-        	/* TODO: put the parity bits */
+        	lin1p3_header[1] = ID;
+        	// Add the parity bits
+        	calculate_parity_bits(lin1p3_header);
         	/* Init the message recevie buffer */
         	memset(lin1p3_message, 0, size_of_uart_buffer);
         	/* Calc the message size */
-        	switch(ID&0x03) {
+        	switch(ID&0x30) {
         		case 0x00: message_size = 2;
         		break;
-        		case 0x01: message_size = 2;
+        		case 0x10: message_size = 2;
         		break;
-        		case 0x02: message_size = 4;
+        		case 0x20: message_size = 4;
         		break;
-        		case 0x03: message_size = 8;
+        		case 0x30: message_size = 8;
         		break;
         	}
         	message_size+=1;
-        	/* Send a Break It is just sending one byte 0, *** CHANGE THIS WITH A REAL SYNCH BREAK ****/
-        	UART_RTOS_Send(handle->uart_rtos_handle, (uint8_t *)&synch_break_byte, 1);
+
+        	/* Configure 13bit break transmission */
+        	handle->uart_config.base->S2 |= (1<<2);
+
+        	/* Send the break signal */
+        	handle->uart_config.base->C2 |= 0x01;
+        	handle->uart_config.base->C2 &= 0xFE;
+
         	vTaskDelay(1);
+
         	/* Send the header */
         	UART_RTOS_Send(handle->uart_rtos_handle, (uint8_t *)lin1p3_header, size_of_lin_header_d);
         	vTaskDelay(1);
@@ -185,7 +204,6 @@ static void slave_task(void *pvParameters)
 	uint8_t  message_size = 0;
 	size_t n;
 	uint8_t  msg_idx;
-	uint8_t synch_break_byte = 0;
 
 	if(handle == NULL) {
 		vTaskSuspend(NULL);
@@ -194,23 +212,25 @@ static void slave_task(void *pvParameters)
     while(1) {
     	/* Init the message header buffer */
     	memset(lin1p3_header, 0, size_of_lin_header_d);
-    	/* Wait for a synch break This code is just waiting for one byte 0, *** CHANGE THIS WITH A REAL SYNCH BREAK ****/
-    	synch_break_byte = 0xFF;
-    	do {
-    		UART_RTOS_Receive(handle->uart_rtos_handle, &synch_break_byte, 1, &n);
-    	}while(synch_break_byte != 0);
+
+    	/* Wait for break */
+		DisableIRQ(UART3_RX_TX_IRQn); //Disable RX interrupt so the break won't mess with the UART_RTOS driver
+		handle->uart_config.base->S2 |= 0x01<<7; //Clear the LIN Break Detect Interrupt Flag
+		handle->uart_config.base->S2 |= 0x01<<1; //Enable LIN Break Detection
+		while((handle->uart_config.base->S2 &  0x01<<7) == 0x00) vTaskDelay(1); //Wait for the flag to be set
+		handle->uart_config.base->S2 &= ~(0x01<<1); //Disable LIN Break Detection
+		handle->uart_config.base->S2 |= 0x01<<7; //Clear the LIN Break Detect Interrupt Flag
+		EnableIRQ(UART3_RX_TX_IRQn); //Enable RX interrupt so the UART_RTOS driver works again
 
     	/* Wait for header on the UART */
     	UART_RTOS_Receive(handle->uart_rtos_handle, lin1p3_header, size_of_lin_header_d, &n);
     	/* Check header */
-    	if(/*(lin1p3_header[0] != 0x00) &&*/
-    	   (lin1p3_header[0] != 0x55)) {
-    		/* TODO: Check ID parity bits */
+    	if((lin1p3_header[0] != 0x55) && (check_parity_bits(lin1p3_header) == true)) {
     		/* Header is not correct we are ignoring the header */
     		continue;
     	}
     	/* Get the message ID */
-    	ID = (lin1p3_header[1] & 0xFC)>>2;
+    	ID = (lin1p3_header[1] & 0x3F);
     	/* If the header is correct, check if the message is in the table */
     	msg_idx = 0;
     	/*Look for the ID in the message table */
@@ -224,14 +244,14 @@ static void slave_task(void *pvParameters)
     	if(msg_idx == lin1d3_max_supported_messages_per_node_cfg_d) continue;
 
     	/* Calc the message size */
-    	switch(ID&0x03) {
+    	switch(ID&0x30) {
     		case 0x00: message_size = 2;
     		break;
-    		case 0x01: message_size = 2;
+    		case 0x10: message_size = 2;
     		break;
-    		case 0x02: message_size = 4;
+    		case 0x20: message_size = 4;
     		break;
-    		case 0x03: message_size = 8;
+    		case 0x30: message_size = 8;
     		break;
     	}
 
@@ -243,16 +263,91 @@ static void slave_task(void *pvParameters)
         	/*If the message is in the table call the message callback */
     		/* User shall fill the message */
         	handle->config.messageTable[msg_idx].handler((void*)lin1p3_message);
-        	/* TODO: Add the checksum to the message */
+        	/* Add the checksum to the message */
+        	calculate_checksum(lin1p3_message, message_size);
         	/* Send the message data */
         	UART_RTOS_Send(handle->uart_rtos_handle, (uint8_t *)lin1p3_message, message_size);
     	}
     	else {
         	/* Wait for Response on the UART */
         	UART_RTOS_Receive(handle->uart_rtos_handle, lin1p3_message, message_size, &n);
-        	/* TODO: Check the checksum on the message */
-        	/*If the message is in the table call the message callback */
-        	handle->config.messageTable[msg_idx].handler((void*)lin1p3_message);
+        	if (check_checksum(lin1p3_message, message_size) == true)
+        	{
+        		/*If the message is in the table call the message callback */
+        		handle->config.messageTable[msg_idx].handler((void*)lin1p3_message);
+        	}
     	}
     }
+}
+
+static void calculate_parity_bits(uint8_t* header)
+{
+	uint8_t id0_bit = (header[1] & ID0_BIT_MASK);
+	uint8_t id1_bit = (header[1] & ID1_BIT_MASK) >> 1;
+	uint8_t id2_bit = (header[1] & ID2_BIT_MASK) >> 2;
+	uint8_t id3_bit = (header[1] & ID3_BIT_MASK) >> 3;
+	uint8_t id4_bit = (header[1] & ID4_BIT_MASK) >> 4;
+	uint8_t id5_bit = (header[1] & ID5_BIT_MASK) >> 5;
+
+	uint8_t even_parity = (id0_bit ^ id1_bit) ^ (id2_bit ^ id4_bit);
+	uint8_t odd_parity =  !((id1_bit ^ id3_bit) ^ (id4_bit ^ id5_bit));
+
+	header[1] |= (even_parity << 6);
+	header[1] |= (odd_parity << 7);
+}
+
+static bool check_parity_bits(uint8_t* header)
+{
+	uint8_t id0_bit = (header[1] & ID0_BIT_MASK);
+	uint8_t id1_bit = (header[1] & ID1_BIT_MASK) >> 1;
+	uint8_t id2_bit = (header[1] & ID2_BIT_MASK) >> 2;
+	uint8_t id3_bit = (header[1] & ID3_BIT_MASK) >> 3;
+	uint8_t id4_bit = (header[1] & ID4_BIT_MASK) >> 4;
+	uint8_t id5_bit = (header[1] & ID5_BIT_MASK) >> 5;
+
+	uint8_t even_parity = (id0_bit ^ id1_bit) ^ (id2_bit ^ id4_bit);
+	uint8_t odd_parity =  !((id1_bit ^ id3_bit) ^ (id4_bit ^ id5_bit));
+
+	if ((((header[1] & EVEN_PARITY_BIT_MASK) >> 6) == even_parity) && (((header[1] & ODD_PARITY_BIT_MASK) >> 7) == odd_parity))
+	{
+		return true;
+	}
+	else
+	{
+		PRINTF("Parity bits check error!\r\n");
+		return false;
+	}
+}
+
+static void calculate_checksum(uint8_t* message, uint8_t message_size)
+{
+	uint8_t checksum = 0;
+
+	for (uint8_t idx = 0; idx < message_size-1; idx++)
+	{
+		checksum = (checksum + message[idx]) % 0xFF;
+	}
+
+	message[message_size-1] = (uint8_t)~checksum;
+}
+
+static bool check_checksum(uint8_t* message, uint8_t message_size)
+{
+	uint8_t checksum = 0;
+
+	for (uint8_t idx = 0; idx < message_size-1; idx++)
+	{
+		checksum = (checksum + message[idx]) % 0xFF;
+	}
+
+	if ((checksum + message[message_size-1]) == 0xFF)
+	{
+		return true;
+	}
+	else
+	{
+		PRINTF("MSG: 0x%x, 0x%x, 0x%x\r\n", message[0], message[1], message[2]);
+		PRINTF("Checksum check error!\r\n");
+		return false;
+	}
 }

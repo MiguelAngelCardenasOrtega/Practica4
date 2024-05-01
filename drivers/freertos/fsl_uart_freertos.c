@@ -36,6 +36,7 @@
 #include <FreeRTOS.h>
 #include <event_groups.h>
 #include <semphr.h>
+#include <fsl_debug_console.h>
 
 /* Component ID definition, used by tools. */
 #ifndef FSL_COMPONENT_ID
@@ -51,7 +52,13 @@ static void UART_RTOS_Callback(UART_Type *base, uart_handle_t *state, status_t s
     xHigherPriorityTaskWoken = pdFALSE;
     xResult = pdFAIL;
 
-    if (status == kStatus_UART_RxIdle)
+
+    if (status == kStatus_UART_LIN_breakDetected)
+	{
+		PRINTF("Detected LIN break 2\r\n");
+		xResult = xEventGroupSetBitsFromISR(handle->rxEvent, RTOS_UART_LIN_BREAK, &xHigherPriorityTaskWoken);
+	}
+    else if (status == kStatus_UART_RxIdle)
     {
         xResult = xEventGroupSetBitsFromISR(handle->rxEvent, RTOS_UART_COMPLETE, &xHigherPriorityTaskWoken);
     }
@@ -69,6 +76,10 @@ static void UART_RTOS_Callback(UART_Type *base, uart_handle_t *state, status_t s
         UART_ClearStatusFlags(base, kUART_RxOverrunFlag);
         xResult =
             xEventGroupSetBitsFromISR(handle->rxEvent, RTOS_UART_HARDWARE_BUFFER_OVERRUN, &xHigherPriorityTaskWoken);
+    }
+    else
+    {
+    	PRINTF("What?\r\n");
     }
 
     if (xResult != pdFAIL)
@@ -291,46 +302,58 @@ int UART_RTOS_Receive(uart_rtos_handle_t *handle, uint8_t *buffer, uint32_t leng
         return kStatus_Fail;
     }
 
-    handle->rxTransfer.data = buffer;
-    handle->rxTransfer.dataSize = (uint32_t)length;
+    /*handle->base->S2 |= 0x01<<7; //Clear the LIN Break Detect Interrupt Flag
+	handle->base->S2 |= 0x01<<1; //Enable LIN Break Detection
 
-    /* Non-blocking call */
-    UART_TransferReceiveNonBlocking(handle->base, handle->t_state, &handle->rxTransfer, &n);
+	ev = xEventGroupWaitBits(handle->rxEvent, RTOS_UART_LIN_BREAK, pdTRUE, pdFALSE, portMAX_DELAY);
 
-    ev = xEventGroupWaitBits(handle->rxEvent,
-                             RTOS_UART_COMPLETE | RTOS_UART_RING_BUFFER_OVERRUN | RTOS_UART_HARDWARE_BUFFER_OVERRUN,
-                             pdTRUE, pdFALSE, portMAX_DELAY);
-    if (ev & RTOS_UART_HARDWARE_BUFFER_OVERRUN)
-    {
-        /* Stop data transfer to application buffer, ring buffer is still active */
-        UART_TransferAbortReceive(handle->base, handle->t_state);
-        /* Prevent false indication of successful transfer in next call of UART_RTOS_Receive.
-           RTOS_UART_COMPLETE flag could be set meanwhile overrun is handled */
-        xEventGroupClearBits(handle->rxEvent, RTOS_UART_COMPLETE);
-        retval = kStatus_UART_RxHardwareOverrun;
-        local_received = 0;
-    }
-    else if (ev & RTOS_UART_RING_BUFFER_OVERRUN)
-    {
-        /* Stop data transfer to application buffer, ring buffer is still active */
-        UART_TransferAbortReceive(handle->base, handle->t_state);
-        /* Prevent false indication of successful transfer in next call of UART_RTOS_Receive.
-           RTOS_UART_COMPLETE flag could be set meanwhile overrun is handled */
-        xEventGroupClearBits(handle->rxEvent, RTOS_UART_COMPLETE);
-        retval = kStatus_UART_RxRingBufferOverrun;
-        local_received = 0;
-    }
-    else if (ev & RTOS_UART_COMPLETE)
-    {
-        retval = kStatus_Success;
-        local_received = length;
-    }
+	if (!(ev & RTOS_UART_LIN_BREAK))
+	{
+		PRINTF("LIN break detection error!\r\n");
+		retval = kStatus_UART_Error;
+		return retval;
+	}*/
 
-    /* Prevent repetitive NULL check */
-    if (received != NULL)
-    {
-        *received = local_received;
-    }
+	handle->rxTransfer.data = buffer;
+	handle->rxTransfer.dataSize = (uint32_t)length;
+
+	/* Non-blocking call */
+	UART_TransferReceiveNonBlocking(handle->base, handle->t_state, &handle->rxTransfer, &n);
+
+	ev = xEventGroupWaitBits(handle->rxEvent,
+							 RTOS_UART_COMPLETE | RTOS_UART_RING_BUFFER_OVERRUN | RTOS_UART_HARDWARE_BUFFER_OVERRUN,
+							 pdTRUE, pdFALSE, portMAX_DELAY);
+	if (ev & RTOS_UART_HARDWARE_BUFFER_OVERRUN)
+	{
+		/* Stop data transfer to application buffer, ring buffer is still active */
+		UART_TransferAbortReceive(handle->base, handle->t_state);
+		/* Prevent false indication of successful transfer in next call of UART_RTOS_Receive.
+		   RTOS_UART_COMPLETE flag could be set meanwhile overrun is handled */
+		xEventGroupClearBits(handle->rxEvent, RTOS_UART_COMPLETE);
+		retval = kStatus_UART_RxHardwareOverrun;
+		local_received = 0;
+	}
+	else if (ev & RTOS_UART_RING_BUFFER_OVERRUN)
+	{
+		/* Stop data transfer to application buffer, ring buffer is still active */
+		UART_TransferAbortReceive(handle->base, handle->t_state);
+		/* Prevent false indication of successful transfer in next call of UART_RTOS_Receive.
+		   RTOS_UART_COMPLETE flag could be set meanwhile overrun is handled */
+		xEventGroupClearBits(handle->rxEvent, RTOS_UART_COMPLETE);
+		retval = kStatus_UART_RxRingBufferOverrun;
+		local_received = 0;
+	}
+	else if (ev & RTOS_UART_COMPLETE)
+	{
+		retval = kStatus_Success;
+		local_received = length;
+	}
+
+	/* Prevent repetitive NULL check */
+	if (received != NULL)
+	{
+		*received = local_received;
+	}
 
     /* Enable next transfer. Current one is finished */
     if (pdFALSE == xSemaphoreGive(handle->rxSemaphore))

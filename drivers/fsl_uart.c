@@ -33,6 +33,7 @@
  */
 
 #include "fsl_uart.h"
+#include "fsl_debug_console.h"
 
 /*******************************************************************************
  * Definitions
@@ -940,6 +941,18 @@ void UART_TransferHandleIRQ(UART_Type *base, uart_handle_t *handle)
     uint8_t count;
     uint8_t tempCount;
 
+    /* If LIN break detection */
+	if ((base->S2 & (0x01<<7)) == 0x80)
+	{
+		PRINTF("LIN Break detected 1\r\n");
+		base->S2 &= ~(0x01<<1); //Disable LIN Break Detection
+		base->S2 |= 0x01<<7; //Clear the LIN Break Detect Interrupt Flag
+		/* Trigger callback. */
+		if (handle->callback)
+		{
+			handle->callback(base, handle, kStatus_UART_LIN_breakDetected, handle->userData);
+		}
+	}
     /* If RX framing error */
     if (UART_S1_FE_MASK & base->S1)
     {
